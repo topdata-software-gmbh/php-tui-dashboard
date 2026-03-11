@@ -35,6 +35,82 @@ Create a lightweight PHP Terminal User Interface (TUI) framework for building ti
 - Current workspace: `/home/marc/devel/test-golang-tui`
 - Target PHP library should be created as separate project structure
 
+### Screen Library API Considerations
+
+**Unicode/Grapheme Support (miss-2):**
+Screen depends on `soloterm/grapheme` for proper Unicode handling. It automatically handles:
+- Wide characters (CJK, emoji) - characters that take 2 columns
+- Grapheme clusters (combined characters like é = e + ◌́)
+- Zero-width joiners (emoji sequences like 👨‍👩‍👧‍👦)
+
+The `writeString()` method in PrintableBuffer automatically detects ASCII vs Unicode and splits appropriately. No manual handling needed in widgets.
+
+**ANSI Handling (sugg-2):**
+Screen automatically parses ANSI escape sequences via `AnsiParser::parseFast()`. When using `write()`:
+- Screen extracts and tracks ANSI codes internally
+- Printable characters go to PrintableBuffer
+- ANSI codes go to AnsiBuffer
+- Cursor movement codes (\e[H, \e[A, etc.) are executed
+
+The `write()` method with manual style wrapping is acceptable - Screen will parse the ANSI codes correctly.
+
+**CellBuffer for Differential Rendering (miss-4):**
+Screen provides `toCellBuffer(?CellBuffer $target)` which exports the visible screen content to a CellBuffer. This enables:
+- Value-based comparison between frames (not just sequence numbers)
+- Direct cell manipulation for advanced scenarios
+- Testing and debugging of rendered output
+
+For most use cases, sequence-number-based differential rendering via `output($sinceSeqNo)` is sufficient.
+
+**Cell Class for Advanced Rendering (miss-6):**
+The `Cell` class represents a single terminal cell with:
+- Character content
+- Style bitmask (bold, italic, underline, etc.)
+- Foreground/background colors (standard and extended 256/RGB)
+- `equals()` for change detection
+- `getStyleTransition()` for efficient ANSI generation
+
+Advanced widgets could use CellBuffer for direct buffer manipulation instead of going through `write()`.
+
+**Wide Character Handling in Widgets:**
+The `truncateText()` method in Widget uses `strlen()` which counts bytes, not display width. For proper Unicode handling, consider using `mb_strwidth()` from the `soloterm/grapheme` package:
+
+**Current (may miscount wide chars):**
+```php
+protected function truncateText(string $text, int $maxLength): string
+{
+    if (strlen($text) <= $maxLength) {
+        return $text;
+    }
+    return substr($text, 0, $maxLength - 3) . '...';
+}
+```
+
+**Improved (handles wide chars correctly):**
+```php
+use SoloTerm\Grapheme\Grapheme;
+
+protected function truncateText(string $text, int $maxWidth): string
+{
+    $width = Grapheme::wcswidth($text);
+    if ($width <= $maxWidth) {
+        return $text;
+    }
+    // Truncate considering grapheme clusters
+    $truncated = Grapheme::substr($text, 0, $maxWidth - 3);
+    return $truncated . '...';
+}
+```
+
+Box-drawing border characters (─, │, ┌, ┐, └, ┘) have wcwidth=1 and work correctly with `str_repeat()`.
+
+**Screen Sizing (miss-3, sugg-1):**
+Screen dimensions are fixed at construction:
+- `width` and `height` are public properties set in constructor
+- `PrintableBuffer.setWidth()` sets line-wrapping behavior
+- No automatic terminal resize detection - application must handle SIGWINCH and recreate Screen
+- Buffer contents are lost when Screen is recreated
+
 ### Testing Commands
 - PHP CLI execution: `php examples/dashboard.php`
 - Dependency management: `composer require soloterm/screen`
@@ -75,13 +151,13 @@ Establish the core framework structure, basic component system, and terminal ren
 **[NEW FILE] composer.json**
 ```json
 {
-    "name": "your-org/php-tui-dashboard",
+    "name": "topdata-software-gmbh/php-tui-dashboard",
     "description": "Lightweight PHP TUI framework for tile-based dashboards",
     "type": "library",
     "license": "MIT",
     "require": {
-        "php": ">=8.1",
-        "soloterm/screen": "^0.1.0"
+        "php": ">=8.3",
+        "soloterm/screen": "dev-main"
     },
     "autoload": {
         "psr-4": {
@@ -271,6 +347,7 @@ class SoloScreenRenderer implements Renderer
 {
     private Screen $screen;
     private ?string $currentStyle = null;
+    private int $lastRenderSeqNo = 0;
 
     public function __construct(int $width, int $height)
     {
@@ -279,41 +356,62 @@ class SoloScreenRenderer implements Renderer
 
     public function clear(): void
     {
+        // Clear screen and reset cursor position using Screen's API
         $this->screen->write("\e[2J");
+        $this->screen->moveCursorRow(absolute: 0);
+        $this->screen->moveCursorCol(absolute: 0);
     }
 
     public function write(string $text): void
     {
+        // Let Screen handle ANSI parsing and cursor management
         if ($this->currentStyle) {
-            $text = $this->currentStyle . $text . "\e[0m";
+            $this->screen->write($this->currentStyle);
+            $this->screen->write($text);
+            $this->screen->write("\e[0m");
+        } else {
+            $this->screen->write($text);
         }
-        $this->screen->write($text);
     }
 
     public function moveTo(Position $position): void
     {
-        $this->screen->write("\e[{$position->y};{$position->x}H");
+        // Use Screen's built-in cursor positioning
+        $this->screen->moveCursorRow(absolute: $position->y);
+        $this->screen->moveCursorCol(absolute: $position->x);
     }
 
     public function setStyle(?string $style): void
     {
+        // Store style for next write operation
         $this->currentStyle = $style;
     }
 
     public function getOutput(?int $sequenceNumber = null): string
     {
-        return $this->screen->output($sequenceNumber);
+        if ($sequenceNumber !== null) {
+            // Differential rendering - only output changes
+            $output = $this->screen->output($sinceSeqNo: $sequenceNumber);
+            $this->lastRenderSeqNo = $this->screen->getLastRenderedSeqNo();
+            return $output;
+        }
+        
+        // Full rendering
+        $output = $this->screen->output();
+        $this->lastRenderSeqNo = $this->screen->getLastRenderedSeqNo();
+        return $output;
     }
 
     public function getLastRenderedSeqNo(): ?int
     {
-        return $this->screen->getLastRenderedSeqNo();
+        return $this->lastRenderSeqNo;
     }
 
     public function getSize(): Size
     {
-        // For now, return fixed size - later we'll detect terminal size
-        return new Size($this->screen->getWidth(), $this->screen->getHeight());
+        // Return Screen's dimensions (set at construction)
+        // For terminal resize detection, use external polling (e.g., SIGWINCH)
+        return new Size($this->screen->width, $this->screen->height);
     }
 }
 ```
@@ -344,9 +442,10 @@ echo $renderer->getOutput();
 
 ### Verification Steps
 1. Run `composer install` to install dependencies
-2. Execute `php examples/basic.php` to verify basic rendering
-3. Confirm terminal output displays styled text correctly
-4. Test differential rendering capabilities
+2. Execute `php examples/basic.php` to verify basic rendering and Screen API integration
+3. Confirm terminal output displays styled text correctly with proper cursor positioning
+4. Test differential rendering capabilities by checking that only changed content is output
+5. Verify terminal size detection works correctly by running in different terminal sizes
 
 ## Phase 2: Layout System Implementation
 
@@ -421,6 +520,16 @@ abstract class Layout
             array_splice($this->components, $index, 1);
             array_splice($this->constraints, $index, 1);
         }
+    }
+
+    public function getComponents(): array
+    {
+        return $this->components;
+    }
+
+    public function getComponentCount(): int
+    {
+        return count($this->components);
     }
 
     abstract public function calculateAreas(Area $container): array;
@@ -725,7 +834,7 @@ $container = new Area(new Position(1, 1), new Size(78, 22));
 $areas = $flexLayout->calculateAreas($container);
 
 foreach ($areas as $index => $area) {
-    $component = $flexLayout->components[$index];
+    $component = $flexLayout->getComponents()[$index];
     $component->setPosition($area->position);
     $component->setSize($area->size);
     $component->render($renderer);
@@ -747,7 +856,7 @@ $container2 = new Area(new Position(1, 1), new Size(78, 22));
 $areas2 = $gridLayout->calculateAreas($container2);
 
 foreach ($areas2 as $index => $area) {
-    $component = $gridLayout->components[$index];
+    $component = $gridLayout->getComponents()[$index];
     $component->setPosition($area->position);
     $component->setSize($area->size);
     $component->render($renderer2);
@@ -896,6 +1005,7 @@ abstract class Widget extends Component
 
     protected function getStyleString(array $style): string
     {
+        // Use Screen's compatible ANSI code generation
         $codes = [];
         
         if ($style['bold'] ?? false) {
@@ -917,7 +1027,10 @@ abstract class Widget extends Component
         if (isset($style['color'])) {
             $colors = [
                 'black' => '30', 'red' => '31', 'green' => '32', 'yellow' => '33',
-                'blue' => '34', 'magenta' => '35', 'cyan' => '36', 'white' => '37'
+                'blue' => '34', 'magenta' => '35', 'cyan' => '36', 'white' => '37',
+                'bright_black' => '90', 'bright_red' => '91', 'bright_green' => '92',
+                'bright_yellow' => '93', 'bright_blue' => '94', 'bright_magenta' => '95',
+                'bright_cyan' => '96', 'bright_white' => '97'
             ];
             $codes[] = $colors[$style['color']] ?? '37';
         }
@@ -925,7 +1038,10 @@ abstract class Widget extends Component
         if (isset($style['bgcolor'])) {
             $colors = [
                 'black' => '40', 'red' => '41', 'green' => '42', 'yellow' => '43',
-                'blue' => '44', 'magenta' => '45', 'cyan' => '46', 'white' => '47'
+                'blue' => '44', 'magenta' => '45', 'cyan' => '46', 'white' => '47',
+                'bright_black' => '100', 'bright_red' => '101', 'bright_green' => '102',
+                'bright_yellow' => '103', 'bright_blue' => '104', 'bright_magenta' => '105',
+                'bright_cyan' => '106', 'bright_white' => '107'
             ];
             $codes[] = $colors[$style['bgcolor']] ?? '40';
         }
@@ -1095,6 +1211,13 @@ class LogWidget extends Widget
                 $renderer->write($char);
             }
         }
+    }
+
+    public function setLogs(array $logs): void
+    {
+        $this->logs = $logs;
+        $this->scrollOffset = 0;
+        $this->autoScroll = true;
     }
 
     private function getVisibleLines(): int
@@ -1662,7 +1785,7 @@ class ETLDashboard
         
         // Position and render all components
         foreach ($areas as $index => $area) {
-            $component = $this->mainLayout->components[$index];
+            $component = $this->mainLayout->getComponents()[$index];
             $component->setPosition($area->position);
             $component->setSize($area->size);
             $component->render($this->renderer);
@@ -1679,8 +1802,6 @@ class ETLDashboard
         $exportProgress = 0.0;
 
         for ($i = 0; $i <= 100; $i += 5) {
-            $this->renderer->clear();
-            
             // Update progress
             $importProgress = min(1.0, $i / 100.0);
             $transformProgress = min(1.0, max(0.0, ($i - 20) / 100.0));
@@ -1713,7 +1834,7 @@ class ETLDashboard
             
             if ($i < 100) {
                 usleep(200000); // 200ms delay
-                system('clear'); // Clear screen for next frame
+                // No manual clear needed - differential rendering handles updates
             }
         }
         
@@ -1729,10 +1850,10 @@ $dashboard->simulateProgress();
 
 ### Verification Steps
 1. Run `php examples/widgets.php` to verify individual widget functionality
-2. Execute `php examples/dashboard.php` to see complete ETL dashboard
-3. Test widget interactions (scrolling, progress updates)
-4. Verify layout responsiveness and rendering performance
-5. Confirm differential rendering works for live updates
+2. Execute `php examples/dashboard.php` to see complete ETL dashboard with differential rendering
+3. Test widget interactions (scrolling, progress updates) and verify smooth performance
+4. Verify layout responsiveness and rendering performance without flickering
+5. Confirm differential rendering works efficiently for live updates (no full screen redraws)
 
 ## Phase 4: Application Framework and Event System
 
@@ -1780,6 +1901,7 @@ namespace PhpTuiDashboard;
 
 use PhpTuiDashboard\Event\EventDispatcher;
 use PhpTuiDashboard\Event\TimerEvent;
+use PhpTuiDashboard\Event\Event;
 use PhpTuiDashboard\Input\InputHandler;
 use PhpTuiDashboard\Layout\FlexLayout;
 use PhpTuiDashboard\Layout\FlexDirection;
@@ -1794,6 +1916,7 @@ class Application
     private bool $running = false;
     private int $fps = 10;
     private ?\Closure $updateCallback = null;
+    private int $lastRenderSeqNo = 0;
 
     public function __construct(int $width = 80, int $height = 24)
     {
@@ -1877,7 +2000,10 @@ class Application
 
     private function render(): void
     {
-        $this->renderer->clear();
+        // Clear only what's necessary for differential rendering
+        if ($this->lastRenderSeqNo === 0) {
+            $this->renderer->clear();
+        }
         
         // Calculate layout
         $container = new Area(
@@ -1889,16 +2015,23 @@ class Application
         
         // Position and render components
         foreach ($areas as $index => $area) {
-            if (isset($this->components[$index])) {
-                $component = $this->components[$index];
+            $components = $this->layout->getComponents();
+            if (isset($components[$index])) {
+                $component = $components[$index];
                 $component->setPosition($area->position);
                 $component->setSize($area->size);
                 $component->render($this->renderer);
             }
         }
         
-        // Output to terminal
-        echo $this->renderer->getOutput();
+        // Use differential rendering for performance
+        $output = $this->renderer->getOutput($this->lastRenderSeqNo);
+        if ($output !== '') {
+            echo $output;
+        }
+        
+        // Update sequence number for next frame
+        $this->lastRenderSeqNo = $this->renderer->getLastRenderedSeqNo();
     }
 
     private function setupEventHandlers(): void
@@ -1920,8 +2053,18 @@ class Application
 
     private function handleResize(int $width, int $height): void
     {
-        // Recreate renderer with new size
+        // Screen does not auto-resize - must recreate with new dimensions
+        // Buffer contents are lost on resize (full re-render required)
         $this->renderer = new SoloScreenRenderer($width, $height);
+        $this->lastRenderSeqNo = 0; // Reset for full re-render
+        
+        // Trigger layout recalculation
+        $this->eventDispatcher->dispatch(new class($width, $height) implements Event {
+            public function __construct(private int $width, private int $height) {}
+            public function getType(): string { return 'system.resized'; }
+            public function getData(): array { return ['width' => $this->width, 'height' => $this->height]; }
+            public function getTimestamp(): float { return microtime(true); }
+        });
     }
 
     private function enableRawMode(): void
@@ -2562,11 +2705,11 @@ $monitor->run();
 ```
 
 ### Verification Steps
-1. Run `php examples/interactive.php` to test interactive elements
+1. Run `php examples/interactive.php` to test interactive elements with differential rendering
 2. Execute `php examples/etl-monitor.php` to verify complete ETL monitoring application
-3. Test keyboard input handling (q, r, c, space, arrow keys)
-4. Verify real-time updates and performance
-5. Test event system responsiveness
+3. Test keyboard input handling (q, r, c, space, arrow keys) and verify responsive event system
+4. Verify real-time updates work smoothly with differential rendering and no screen flicker
+5. Test terminal resize handling and confirm layout adapts correctly
 
 ## Phase 5: Documentation and Open Source Preparation
 
@@ -2632,7 +2775,7 @@ A lightweight, dependency-minimal PHP framework for building beautiful terminal-
 ### Installation
 
 ```bash
-composer require your-org/php-tui-dashboard
+composer require topdata-software-gmbh/php-tui-dashboard
 ```
 
 ### Basic Example
@@ -2792,7 +2935,7 @@ This library is inspired by excellent TUI frameworks like:
 ### Composer Installation
 
 ```bash
-composer require your-org/php-tui-dashboard
+composer require topdata-software-gmbh/php-tui-dashboard
 ```
 
 ### Manual Installation
